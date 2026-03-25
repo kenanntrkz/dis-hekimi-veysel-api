@@ -2,13 +2,21 @@ import { FastifyInstance } from 'fastify';
 import { requireAuth } from '../plugins/auth.js';
 import { sendAppointmentNotification } from '../lib/mailer.js';
 
+function generateReferenceCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // belirsiz karakterler çıkarıldı (0,O,I,1)
+  let code = 'DT-';
+  for (let i = 0; i < 5; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
 export async function appointmentRoutes(app: FastifyInstance) {
   // Public: seçilen güne ait dolu saatleri getir
   app.get('/slots', async (request, reply) => {
     const { date } = request.query as { date?: string };
     if (!date) return reply.status(400).send({ message: 'date parametresi gerekli (YYYY-MM-DD)' });
 
-    // Günün başı ve sonu (UTC)
     const dayStart = new Date(`${date}T00:00:00.000Z`);
     const dayEnd = new Date(`${date}T23:59:59.999Z`);
 
@@ -20,7 +28,6 @@ export async function appointmentRoutes(app: FastifyInstance) {
       select: { date: true },
     });
 
-    // "HH:MM" formatında dolu saatler listesi
     const slots = taken.map((a) => {
       const d = new Date(a.date);
       const h = d.getUTCHours().toString().padStart(2, '0');
@@ -29,6 +36,96 @@ export async function appointmentRoutes(app: FastifyInstance) {
     });
 
     return reply.send({ bookedSlots: slots });
+  });
+
+  // Public: referans koduyla randevu sorgula
+  app.get('/lookup', async (request, reply) => {
+    const { code } = request.query as { code?: string };
+    if (!code) return reply.status(400).send({ message: 'Randevu kodu gerekli' });
+
+    const appointment = await app.prisma.appointment.findUnique({
+      where: { referenceCode: code.toUpperCase().trim() },
+    });
+
+    if (!appointment) {
+      return reply.status(404).send({ message: 'Randevu bulunamadı. Kodu kontrol edin.' });
+    }
+
+    return reply.send(appointment);
+  });
+
+  // Public: referans koduyla randevu iptal et
+  app.post('/cancel', async (request, reply) => {
+    const { code } = request.body as { code?: string };
+    if (!code) return reply.status(400).send({ message: 'Randevu kodu gerekli' });
+
+    const appointment = await app.prisma.appointment.findUnique({
+      where: { referenceCode: code.toUpperCase().trim() },
+    });
+
+    if (!appointment) {
+      return reply.status(404).send({ message: 'Randevu bulunamadı.' });
+    }
+
+    if (appointment.status === 'cancelled') {
+      return reply.status(400).send({ message: 'Bu randevu zaten iptal edilmiş.' });
+    }
+
+    if (appointment.status === 'confirmed') {
+      // Onaylanmış randevuyu hasta iptal etmek istiyorsa uyar ama izin ver
+    }
+
+    const updated = await app.prisma.appointment.update({
+      where: { referenceCode: code.toUpperCase().trim() },
+      data: { status: 'cancelled' },
+    });
+
+    if (updated.email) {
+      sendAppointmentNotification(updated.email, updated.name, updated.date, 'cancelled').catch(() => {});
+    }
+
+    return reply.send(updated);
+  });
+
+  // Public: referans koduyla randevu yeniden planla
+  app.post('/reschedule', async (request, reply) => {
+    const { code, date } = request.body as { code?: string; date?: string };
+    if (!code || !date) return reply.status(400).send({ message: 'Randevu kodu ve yeni tarih gerekli' });
+
+    const appointment = await app.prisma.appointment.findUnique({
+      where: { referenceCode: code.toUpperCase().trim() },
+    });
+
+    if (!appointment) {
+      return reply.status(404).send({ message: 'Randevu bulunamadı.' });
+    }
+
+    if (appointment.status === 'cancelled') {
+      return reply.status(400).send({ message: 'İptal edilmiş randevu yeniden planlanamaz. Yeni randevu oluşturun.' });
+    }
+
+    const newDate = new Date(date);
+    const slotEnd = new Date(newDate.getTime() + 59 * 1000);
+
+    // Çakışma kontrolü (kendi randevusu hariç)
+    const conflict = await app.prisma.appointment.findFirst({
+      where: {
+        date: { gte: newDate, lte: slotEnd },
+        status: { in: ['pending', 'confirmed'] },
+        NOT: { referenceCode: code.toUpperCase().trim() },
+      },
+    });
+
+    if (conflict) {
+      return reply.status(409).send({ message: 'Bu saat dolu. Lütfen başka bir saat seçin.' });
+    }
+
+    const updated = await app.prisma.appointment.update({
+      where: { referenceCode: code.toUpperCase().trim() },
+      data: { date: newDate, status: 'pending' }, // yeniden pending'e düşer, doktor tekrar onaylar
+    });
+
+    return reply.send(updated);
   });
 
   // Public: randevu talebi oluştur
@@ -47,26 +144,32 @@ export async function appointmentRoutes(app: FastifyInstance) {
     }
 
     const requestedDate = new Date(date);
-
-    // Çakışma kontrolü: aynı dakikada pending/confirmed randevu var mı?
-    const slotStart = new Date(requestedDate);
-    const slotEnd = new Date(requestedDate.getTime() + 59 * 1000); // aynı dakika aralığı
+    const slotEnd = new Date(requestedDate.getTime() + 59 * 1000);
 
     const conflict = await app.prisma.appointment.findFirst({
       where: {
-        date: { gte: slotStart, lte: slotEnd },
+        date: { gte: requestedDate, lte: slotEnd },
         status: { in: ['pending', 'confirmed'] },
       },
     });
 
     if (conflict) {
-      return reply.status(409).send({
-        message: 'Bu saat dolu. Lütfen başka bir saat seçin.',
-      });
+      return reply.status(409).send({ message: 'Bu saat dolu. Lütfen başka bir saat seçin.' });
     }
+
+    // Benzersiz referans kodu üret
+    let referenceCode: string;
+    let attempts = 0;
+    do {
+      referenceCode = generateReferenceCode();
+      const exists = await app.prisma.appointment.findUnique({ where: { referenceCode } });
+      if (!exists) break;
+      attempts++;
+    } while (attempts < 10);
 
     const appointment = await app.prisma.appointment.create({
       data: {
+        referenceCode,
         name,
         phone,
         email: email || null,
