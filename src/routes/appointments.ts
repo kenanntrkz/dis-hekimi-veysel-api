@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { requireAuth } from '../plugins/auth.js';
-import { sendAppointmentNotification } from '../lib/mailer.js';
+import { sendAppointmentNotification, sendAppointmentCreated } from '../lib/mailer.js';
 
 function generateReferenceCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // belirsiz karakterler çıkarıldı (0,O,I,1)
@@ -179,6 +179,10 @@ export async function appointmentRoutes(app: FastifyInstance) {
       },
     });
 
+    if (appointment.email && appointment.referenceCode) {
+      sendAppointmentCreated(appointment.email, appointment.name, appointment.date, appointment.referenceCode).catch(() => {});
+    }
+
     return reply.status(201).send(appointment);
   });
 
@@ -205,7 +209,8 @@ export async function appointmentRoutes(app: FastifyInstance) {
         appointment.email,
         appointment.name,
         appointment.date,
-        status as 'confirmed' | 'cancelled'
+        status as 'confirmed' | 'cancelled',
+        appointment.referenceCode
       ).catch(() => {});
     }
 
